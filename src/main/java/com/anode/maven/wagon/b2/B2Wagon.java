@@ -48,10 +48,52 @@ import java.io.*;
 @Component(role = org.apache.maven.wagon.Wagon.class, hint = "b2")
 public class B2Wagon extends AbstractWagon {
 
-    private String bucketName;
-    private String basePath;
     private B2StorageClient b2Client;
-    private String bucketId;
+    // Cache bucket IDs to avoid repeated lookups for the same bucket
+    private java.util.Map<String, String> bucketIdCache = new java.util.HashMap<>();
+
+    /**
+     * Gets the bucket name from the current repository URL.
+     * This is called dynamically to support repository switching during a session.
+     */
+    private String getBucketName() {
+        return getRepository().getHost();
+    }
+
+    /**
+     * Gets the base path from the current repository URL.
+     * This is called dynamically to support repository switching during a session.
+     */
+    private String getBasePath() {
+        String path = getRepository().getBasedir();
+        String basePath = path != null && !path.isEmpty() ? path : "";
+        if (basePath.startsWith("/")) {
+            basePath = basePath.substring(1);
+        }
+        if (!basePath.isEmpty() && !basePath.endsWith("/")) {
+            basePath += "/";
+        }
+        return basePath;
+    }
+
+    /**
+     * Gets the bucket ID for the current bucket, using cache to avoid repeated lookups.
+     */
+    private String getBucketId() throws TransferFailedException {
+        String bucketName = getBucketName();
+        if (!bucketIdCache.containsKey(bucketName)) {
+            try {
+                B2Bucket bucket = b2Client.getBucketOrNullByName(bucketName);
+                if (bucket == null) {
+                    throw new TransferFailedException("Bucket not found: " + bucketName + ". Ensure the bucket exists and credentials have access.");
+                }
+                bucketIdCache.put(bucketName, bucket.getBucketId());
+            } catch (B2Exception e) {
+                throw new TransferFailedException("Failed to get bucket ID for: " + bucketName, e);
+            }
+        }
+        return bucketIdCache.get(bucketName);
+    }
 
     /**
      * Ensures the B2 client is initialized and connected.
@@ -68,27 +110,14 @@ public class B2Wagon extends AbstractWagon {
     protected void openConnectionInternal() throws ConnectionException, AuthenticationException {
         String keyId = getAuthenticationInfo().getUserName();
         String applicationKey = getAuthenticationInfo().getPassword();
-        
+
         if (keyId == null || applicationKey == null) {
             throw new AuthenticationException("B2 credentials not provided. Ensure server credentials are configured in settings.xml");
         }
 
-        // Parse bucket name and path from repository URL
-        // Format: b2://bucket-name/path/to/repo
-        String host = getRepository().getHost();
-        String path = getRepository().getBasedir();
-        
-        if (host == null || host.isEmpty()) {
+        String bucketName = getBucketName();
+        if (bucketName == null || bucketName.isEmpty()) {
             throw new ConnectionException("Bucket name not specified in repository URL");
-        }
-        
-        bucketName = host;
-        basePath = path != null && !path.isEmpty() ? path : "";
-        if (basePath.startsWith("/")) {
-            basePath = basePath.substring(1);
-        }
-        if (!basePath.isEmpty() && !basePath.endsWith("/")) {
-            basePath += "/";
         }
 
         try {
@@ -96,17 +125,17 @@ public class B2Wagon extends AbstractWagon {
             b2Client = B2StorageClientFactory
                 .createDefaultFactory()
                 .create(keyId, applicationKey, "maven-wagon-b2/1.0");
-            
-            // Get bucket ID
+
+            // Get and cache the bucket ID for the initial bucket
             B2Bucket bucket = b2Client.getBucketOrNullByName(bucketName);
             if (bucket == null) {
                 throw new ConnectionException("Bucket not found: " + bucketName + ". Ensure the bucket exists and credentials have access.");
             }
-            bucketId = bucket.getBucketId();
-            
+            bucketIdCache.put(bucketName, bucket.getBucketId());
+
             // Log successful connection (visible with -X flag)
-            System.out.println("[B2 Wagon] Successfully connected to bucket: " + bucketName + " (ID: " + bucketId + ")");
-            
+            System.out.println("[B2 Wagon] Successfully connected to bucket: " + bucketName + " (ID: " + bucket.getBucketId() + ")");
+
         } catch (B2Exception e) {
             throw new ConnectionException("Failed to connect to B2: " + e.getMessage(), e);
         }
@@ -122,28 +151,29 @@ public class B2Wagon extends AbstractWagon {
             }
             b2Client = null;
         }
-        bucketId = null;
+
+        bucketIdCache.clear();
     }
 
     @Override
-    public void get(String resourceName, File destination) 
+    public void get(String resourceName, File destination)
             throws TransferFailedException, ResourceDoesNotExistException, AuthorizationException {
-        
+
         // Ensure connection is established
         if (b2Client == null) {
             throw new TransferFailedException("B2 client not initialized. Connection may not have been opened.");
         }
-        
+
         Resource resource = new Resource(resourceName);
         fireGetInitiated(resource, destination);
         fireGetStarted(resource, destination);
 
         try {
-            String fileName = basePath + resourceName;
-            
+            String fileName = getBasePath() + resourceName;
+
             // Create download request
             B2DownloadByNameRequest downloadRequest = B2DownloadByNameRequest
-                .builder(bucketName, fileName)
+                .builder(getBucketName(), fileName)
                 .build();
             
             // Download to temporary file first, then move to destination
@@ -186,24 +216,24 @@ public class B2Wagon extends AbstractWagon {
     }
 
     @Override
-    public boolean getIfNewer(String resourceName, File destination, long timestamp) 
+    public boolean getIfNewer(String resourceName, File destination, long timestamp)
             throws TransferFailedException, ResourceDoesNotExistException, AuthorizationException {
-        
+
         try {
-            String fileName = basePath + resourceName;
-            
+            String fileName = getBasePath() + resourceName;
+
             // Get file info to check modification time
-            B2FileVersion fileVersion = b2Client.getFileInfoByName(bucketName, fileName);
+            B2FileVersion fileVersion = b2Client.getFileInfoByName(getBucketName(), fileName);
             long uploadTimestamp = fileVersion.getUploadTimestamp();
-            
+
             // If remote file is newer, download it
             if (uploadTimestamp > timestamp) {
                 get(resourceName, destination);
                 return true;
             }
-            
+
             return false;
-            
+
         } catch (B2NotFoundException e) {
             throw new ResourceDoesNotExistException("Resource not found: " + resourceName, e);
         } catch (B2Exception e) {
@@ -214,29 +244,36 @@ public class B2Wagon extends AbstractWagon {
     }
 
     @Override
-    public void put(File source, String destination) 
+    public void put(File source, String destination)
             throws TransferFailedException, ResourceDoesNotExistException, AuthorizationException {
-        
-        
+
         // Ensure connection is established
         if (b2Client == null) {
-            try{
+            try {
                 ensureConnected();
-            }catch(Exception e){
+            } catch (Exception e) {
                 throw new TransferFailedException("B2 client not initialized. Connection may not have been opened.", e);
             }
         }
-        
+
+        // Get current repository's path dynamically (not cached)
+        String basePath = getBasePath();
+        String bucketName = getBucketName();
+        System.out.println("[B2 Wagon] put() - Repository ID: " + getRepository().getId());
+        System.out.println("[B2 Wagon] put() - Repository URL: " + getRepository().getUrl());
+        System.out.println("[B2 Wagon] put() - Bucket: " + bucketName);
+        System.out.println("[B2 Wagon] put() - BasePath: " + basePath);
+        System.out.println("[B2 Wagon] put() - Destination: " + destination);
         Resource resource = new Resource(destination);
         firePutInitiated(resource, source);
         firePutStarted(resource, source);
 
         try {
             String fileName = basePath + destination;
-            
+           
             // Create content source from file
             B2FileContentSource contentSource = B2FileContentSource.build(source);
-            
+
             // Determine content type
             String contentType = B2ContentTypes.B2_AUTO;
             if (fileName.endsWith(".pom")) {
@@ -248,17 +285,17 @@ public class B2Wagon extends AbstractWagon {
             } else if (fileName.endsWith(".sha1") || fileName.endsWith(".md5")) {
                 contentType = B2ContentTypes.TEXT_PLAIN;
             }
-            
+
             // Create upload request
             B2UploadFileRequest uploadRequest = B2UploadFileRequest
-                .builder(bucketId, fileName, contentType, contentSource)
+                .builder(getBucketId(), fileName, contentType, contentSource)
                 .build();
-            
+
             // Upload file
             b2Client.uploadSmallFile(uploadRequest);
-            
+
             firePutCompleted(resource, source);
-            
+
         } catch (B2Exception e) {
             throw new TransferFailedException("B2 error uploading resource: " + destination, e);
         }
@@ -267,8 +304,8 @@ public class B2Wagon extends AbstractWagon {
     @Override
     public boolean resourceExists(String resourceName) throws TransferFailedException, AuthorizationException {
         try {
-            String fileName = basePath + resourceName;
-            B2FileVersion fileVersion = b2Client.getFileInfoByName(bucketName, fileName);
+            String fileName = getBasePath() + resourceName;
+            B2FileVersion fileVersion = b2Client.getFileInfoByName(getBucketName(), fileName);
             return fileVersion != null;
         } catch (B2NotFoundException e) {
             return false;
