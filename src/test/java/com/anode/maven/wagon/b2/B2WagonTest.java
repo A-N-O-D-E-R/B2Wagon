@@ -54,6 +54,9 @@ public class B2WagonTest {
 
     @Before
     public void setUp() throws Exception {
+        // Clear static connection pool and bucket cache before each test
+        clearStaticFields();
+
         wagon = new B2Wagon();
 
         // Set up authentication
@@ -155,7 +158,8 @@ public class B2WagonTest {
 
         wagon.disconnect();
 
-        verify(mockB2Client).close();
+        // Verify that disconnect() doesn't actually close the pooled connection
+        verify(mockB2Client, never()).close();
     }
 
     @Test
@@ -163,12 +167,11 @@ public class B2WagonTest {
         // Inject mock client
         injectMockClient();
 
-        doThrow(new RuntimeException("Close error")).when(mockB2Client).close();
-
-        // Should not throw exception
+        // Should not throw exception even if there's an error
         wagon.disconnect();
 
-        verify(mockB2Client).close();
+        // Verify that disconnect() doesn't actually close the pooled connection
+        verify(mockB2Client, never()).close();
     }
 
     @Test
@@ -344,7 +347,9 @@ public class B2WagonTest {
             wagon.put(sourceFile, destination);
             fail("Should throw TransferFailedException when not connected");
         } catch (TransferFailedException e) {
-            assertTrue(e.getMessage().contains("B2 client not initialized"));
+            // The error message is about failing to establish connection
+            assertTrue(e.getMessage().contains("Failed to establish connection") ||
+                       e.getMessage().contains("B2 client not initialized"));
         }
 
         sourceFile.delete();
@@ -426,7 +431,9 @@ public class B2WagonTest {
             wagon.get(resourceName, destination);
             fail("Should throw TransferFailedException when not connected");
         } catch (TransferFailedException e) {
-            assertTrue(e.getMessage().contains("B2 client not initialized"));
+            // The error message is about failing to establish connection
+            assertTrue(e.getMessage().contains("Failed to establish connection") ||
+                       e.getMessage().contains("B2 client not initialized"));
         }
 
         destination.delete();
@@ -598,15 +605,32 @@ public class B2WagonTest {
     // Helper methods
 
     @SuppressWarnings("unchecked")
+    private void clearStaticFields() throws Exception {
+        // Clear the static connection pool
+        Field connectionPoolField = B2Wagon.class.getDeclaredField("connectionPool");
+        connectionPoolField.setAccessible(true);
+        java.util.Map<String, B2StorageClient> pool = (java.util.Map<String, B2StorageClient>) connectionPoolField.get(null);
+        pool.clear();
+
+        // Clear the static bucket ID cache
+        Field bucketIdCacheField = B2Wagon.class.getDeclaredField("bucketIdCache");
+        bucketIdCacheField.setAccessible(true);
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) bucketIdCacheField.get(null);
+        cache.clear();
+    }
+
+    @SuppressWarnings("unchecked")
     private void injectMockClient() throws Exception {
-        Field b2ClientField = B2Wagon.class.getDeclaredField("b2Client");
-        b2ClientField.setAccessible(true);
-        b2ClientField.set(wagon, mockB2Client);
+        // Inject mock client into the static connectionPool
+        Field connectionPoolField = B2Wagon.class.getDeclaredField("connectionPool");
+        connectionPoolField.setAccessible(true);
+        java.util.Map<String, B2StorageClient> pool = (java.util.Map<String, B2StorageClient>) connectionPoolField.get(null);
+        pool.put("test-bucket", mockB2Client);
 
         // Populate the bucket ID cache so getBucketId() doesn't try to look it up
         Field bucketIdCacheField = B2Wagon.class.getDeclaredField("bucketIdCache");
         bucketIdCacheField.setAccessible(true);
-        java.util.Map<String, String> cache = (java.util.Map<String, String>) bucketIdCacheField.get(wagon);
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) bucketIdCacheField.get(null);
         cache.put("test-bucket", "test-bucket-id");
     }
 
