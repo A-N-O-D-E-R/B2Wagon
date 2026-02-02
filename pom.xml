@@ -22,8 +22,8 @@
     </licenses>
 
     <scm>
-        <connection>scm:git:git://github.com/A-N-O-D-E-R/B2Wagon.git</connection>
-        <developerConnection>scm:git:git://github.com/A-N-O-D-E-R/B2Wagon.git</developerConnection>
+        <connection>scm:git:https://github.com/A-N-O-D-E-R/B2Wagon.git</connection>
+        <developerConnection>scm:git:https://github.com/A-N-O-D-E-R/B2Wagon.git</developerConnection>
         <url>https://github.com/A-N-O-D-E-R/B2Wagon</url>
         <tag>HEAD</tag>
     </scm>
